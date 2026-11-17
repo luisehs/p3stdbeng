@@ -609,11 +609,21 @@ std::uint32_t BPlusTree::tree_search(std::uint32_t block,
     // (routing_child_index), release the pin, and recurse into that
     // child with levels_remaining - 1. An empty tree (kNoPage) also
     // returns kNoPage.
-    (void)block;
-    (void)levels_remaining;
-    (void)key_bytes;
-    (void)error;
-    return idx::kNoPage;
+    if(block == idx::kNoPage || levels_remaining <= 1) {
+        return block;
+    }
+    std::size_t frame = 0;
+    BptSeparatorPage page;
+    if(!pin_separator(block, page, frame, error)) {
+        return idx::kNoPage;
+    }
+    std::size_t pos = page.routing_child_index(key_bytes.data(), codec_);
+    std::uint32_t child = page.first_child();
+    if(pos > 0) {
+        child = page.child(pos - 1);
+    }
+    release(manager_, frame, false);
+    return tree_search(child, levels_remaining - 1, key_bytes, error);
 }
 // BPlusTree::run_start — the equal-key run's leftmost leaf: walks left
 // from the landing leaf while the previous leaf's LAST key EQUALS the
@@ -639,10 +649,34 @@ std::uint32_t BPlusTree::run_start(std::uint32_t landing,
     // compare its last entry's key with key_bytes, release; stop and
     // return `current` when prev is kNoPage or the tail does not equal
     // the target, else continue from prev.
-    (void)landing;
-    (void)key_bytes;
-    (void)error;
-    return idx::kNoPage;
+   std::uint32_t current = landing;
+   while(current != idx::kNoPage) {
+        std::size_t frame = 0;
+
+        BptLeafPage leaf;
+        if(!pin_leaf(current, leaf, frame, error)) {
+                return idx::kNoPage;
+        }
+        std::uint32_t prev = leaf.prev_leaf();
+        release(manager_, frame, false);
+        if(prev == idx::kNoPage) {
+            break;
+        }
+
+        BptLeafPage prev_leaf;
+        if(!pin_leaf(prev, prev_leaf, frame, error)) {
+           return idx::kNoPage;
+        }
+        std::size_t prev_count = prev_leaf.count();
+        bool equal = prev_count > 0 && codec_.compare(prev_leaf.get_entry(prev_count - 1), key.data(),key_bytes.data()) == 0;
+        release(manager_, frame, false);
+        if(!equal) {
+           break;
+        }
+        current = prev;
+    
+     }
+     return current;
 }
 // BPlusTree::gather_run — collects every entry whose key equals the
 // target, scanning leaves left to right from `start`: the run continues
@@ -663,11 +697,32 @@ bool BPlusTree::gather_run(const std::string& key_bytes, std::uint32_t start,
     // while keys compare equal, pushing each entry's rid into `out`;
     // the run continues into next_leaf while the leaf's LAST key equals
     // the target. Stop at the first leaf whose last key differs.
-    (void)key_bytes;
-    (void)start;
-    (void)out;
-    (void)error;
-    return false;
+    std::uint32_t current = start;
+    while(current != idx::kNoPage) {
+        std::size_t frame = 0;
+        BptLeafPage leaf;
+        if(!pin_leaf(current, leaf, frame, error)) {
+            return false;
+        }
+        std::size_t n = leaf.count();
+       for(std::size_t i = leaf.lower_bound(key_bytes.data(), codec_); i < n; ++i) {
+            idx::DataEntry entry = leaf.get_entry(i);
+            if(codec_.compare(entry.key.data(), key_bytes.data()) != 0) {
+                break;
+            }
+            out.push_back(entry.rid);
+        }
+        bool run_continues = n>0&& codec_.compare(leaf.get_entry(n - 1).key.data(), key_bytes.data()) == 0;
+        std::uint32_t next = leaf.next_leaf();
+       
+        release(manager_, frame, false);
+        if(!run_continues) {
+            break;
+        }
+        current = next;
+    }
+    return true; 
+
 }
 // BPlusTree::locate_in_run — finds the exact (key, rid) entry within
 // the equal-key run: the leaves are scanned for the pair, so the erase
@@ -694,12 +749,41 @@ bool BPlusTree::locate_in_run(const std::string& key_bytes, idx::Rid rid,
     // out-parameters. Continue into next_leaf while the last key equals
     // the target; a run that exhausts without the rid is a named error
     // ("no index entry for key ... and rid ...").
-    (void)key_bytes;
-    (void)rid;
-    (void)start;
-    (void)leaf_block;
-    (void)pos;
-    (void)error;
+    std::uint32_t current = start;
+    while(current != idx::kNoPage) {
+        std::size_t frame = 0;
+        BptLeafPage leaf;
+        if(!pin_leaf(current, leaf, frame, error)) {
+            return false;
+        }
+        bool found = false;
+
+        std::size_t n = leaf.count();
+        for(std::size_t i = leaf.lower_bound(key_bytes.data(), codec_); i < n; ++i) {
+            idx::DataEntry entry = leaf.get_entry(i);
+            if(codec_.compare(entry.key.data(), key_bytes.data()) != 0) {
+                break;
+            }
+            if(entry.rid == rid) {
+                leaf_block = current;
+                pos = i;
+                found = true;
+                break;
+            }
+        }
+        bool run_continues = n > 0 && codec_.compare(leaf.get_entry(n - 1).key.data(), key_bytes.data()) == 0;
+        std::uint32_t next = leaf.next_leaf();
+       
+        release(manager_, frame, false);
+        if(found) {
+            return true;
+        }
+        if(!run_continues) {
+            break;
+        }
+        current = next;
+    }
+    error = "no index entry for key and rid (page "+ std::to_string(rid.page_id) + " slot " + std::to_string(rid.slot) + ")";
     return false;
 }
 // BPlusTree::lookup — all entries whose key equals `key`: descend by
@@ -1115,13 +1199,41 @@ bool BPlusTree::erase_rec(std::uint32_t block, std::uint32_t levels_remaining,
     // child (set_separator_key) — or propagate the change upward when
     // the child is the first child. Fill `up` with this page's own
     // post-repair state.
-    (void)block;
-    (void)levels_remaining;
-    (void)key_bytes;
-    (void)rid;
-    (void)up;
-    (void)error;
-    return false;
+   up = EraseUp{};
+   if(levels_remaining <= 1) {
+        return erase_leaf(block, key_bytes, rid, up, error);
+   }
+   std::size_t frame = 0;
+    BptSeparatorPage page;
+    if(!pin_separator(block, page, frame, error)) {
+        return false;
+    }
+    std::size_t pos = page.routing_child_index(key_bytes.data(), codec_);
+    std::uint32_t child = page.first_child();
+    if(pos > 0) {
+        child = page.child(pos - 1);
+    }
+    release(manager_, frame, false);
+
+    EraseUp child_up;
+    if(!erase_rec(child, levels_remaining - 1, key_bytes, rid, child_up, error)) {
+        return false;
+    }
+    if(child_up.first_changed){
+        if(pos == 0) {
+            up.first_changed = true;
+            up.new_first = child_up.new_first;
+        }else if (!pin_separator(block, page, frame, error)) {
+            return false;
+        }
+        page.set_separator_key(pos - 1, child_up.new_first.data());
+        release(manager_, frame, true);
+    }
+    if(child_up.underflow) {
+        return fix_child_underflow(block, levels_remaining, pos, up, error);
+        }
+    return true;
+
 }
 // BPlusTree::erase_leaf — the leaf phase of erase_rec: find the exact
 // (key, rid) entry in this leaf's equal-key run, erase it (the
@@ -1147,12 +1259,47 @@ bool BPlusTree::erase_leaf(std::uint32_t block, const std::string& key_bytes,
     // fill `up`: underflow when count < min_leaf_entries(); when the
     // erased entry was the first, report whether the first key moved
     // (up.first_changed + up.new_first); an emptied leaf reports both.
-    (void)block;
-    (void)key_bytes;
-    (void)rid;
-    (void)up;
-    (void)error;
-    return false;
+    up = EraseUp{};
+
+    std::size_t frame = 0;
+    BptLeafPage leaf;
+    if (!pin_leaf(block, leaf, frame, error)) {
+        return false;
+    }
+
+    std::size_t n = leaf.count();
+    std::size_t pos = n;
+    for (std::size_t i = leaf.lower_bound(key_bytes.data(), codec_); i < n; ++i) {
+        idx::DataEntry entry = leaf.get_entry(i);
+        if (codec_.compare(entry.key.data(), key_bytes.data()) != 0) {
+            break;
+        }
+        if (entry.rid == rid) {
+            pos = i;
+            break;
+        }
+    }
+    if (pos == n) {
+        release(manager_, frame, false);
+        error = "no index entry for key and rid (page " + std::to_string(rid.page_id) + " slot " + std::to_string(rid.slot) + ")";
+        return false;
+    }
+
+    if (!leaf.erase_entry(pos, error)) {
+        release(manager_, frame, false);
+        return false;
+    }
+
+    up.underflow = leaf.count() < min_leaf_entries();
+    if (pos == 0) {
+        up.first_changed = true;
+        if (leaf.count() > 0) {
+            up.new_first = leaf.get_entry(0).key;
+        }
+    }
+    release(manager_, frame, true);
+    return true;
+
 }
 // BPlusTree::fix_child_underflow — repairs a child holding fewer than d
 // entries: redistribute with a sibling that can lend (left preferred,
@@ -1182,12 +1329,56 @@ bool BPlusTree::fix_child_underflow(std::uint32_t block,
     // can lend (left preferred, then right — borrow_from_left /
     // borrow_from_right); otherwise merge_child. Fill `up` with this
     // page's own underflow state afterwards (a merge dropped one pair).
-    (void)block;
-    (void)levels_remaining;
-    (void)child_index;
-    (void)up;
-    (void)error;
-    return false;
+   std::size_t frame = 0;
+    BptSeparatorPage page;
+    if (!pin_separator(block, page, frame, error)) {
+        return false;
+    }
+    std::uint32_t n= page.count();
+    std::uint32_t child=page.first_child();
+    if (child_index > 0) {
+        child = page.child(child_index - 1);
+    }
+    std::uint32_t left = idx::kNoPage;
+    std::uint32_t right = idx::kNoPage;
+    if (child_index > 0) {
+       if(child_index==1) {
+            left = page.first_child();
+        }else {
+            left = page.child(child_index - 2);
+        }
+    }
+    if (child_index < n) {
+        right = page.child(child_index );
+    }
+    release(manager_, frame, false);
+
+    bool child_is_leaf = levels_remaining == 2;
+    std::size_t minimum = child_is_leaf ? min_leaf_entries() : min_separator_keys();
+    error.clear();
+    std::size_t child_count = quick_count(child, child_is_leaf, error);
+    if (!error.empty()) {
+        return false;
+    }
+    if(left != idx::kNoPage) {
+        std::size_t left_count = quick_count(left, child_is_leaf, error);
+        if (!error.empty()) {
+            return false;
+        }
+        if (left_count > minimum) {
+            return borrow_from_left(block, child_index, child, left, child_is_leaf, child_count, up, error);
+        }
+    }
+    if(right != idx::kNoPage) {
+        std::size_t right_count = quick_count(right, child_is_leaf, error);
+        if (!error.empty()) {
+            return false;
+        }
+        if (right_count > minimum) {
+            return borrow_from_right(block, child_index, child, right, child_is_leaf, child_count, up, error);
+        }
+    }
+    return merge_child(block, child_index, child, left, right, child_is_leaf, child_count, up, error);
 }
 // BPlusTree::quick_count — a page's occupancy for the repair decision
 // (can the sibling lend?), read through a short-lived pin.
@@ -1613,13 +1804,98 @@ bool BPlusTree::verify_rec(std::uint32_t block, std::uint32_t depth,
     // minimum upward. At a leaf: order, every rid judged through
     // occupied (dangling findings), walked += count, depth range
     // updated, and the subtree minimum reported (nullopt when empty).
-    (void)block;
-    (void)depth;
-    (void)is_root;
-    (void)walk;
-    (void)error;
-    (void)subtree_min;
-    return false;
+
+    if(subtree_min!=nullptr){
+        subtree_min->reset();
+        }
+    std::string label = "block "+ std::to_string(block);
+    if(block==0){
+        walk.findings.push_back(label + " is the header, not a tree page");
+        return true;
+    }if(block>=walk.seen.size()){
+        walk.findings.push_back(label + " is beyond the file");
+        return true;
+    }if(walk.seen[block]!=0){
+        walk.findings.push_back(label + " is reachable twice");
+        return true;
+    }
+    walk.seen[block] = 1;
+    
+    std::size_t frame = 0;
+
+    if(depth<levels_){
+        BptSeparatorPage page;
+        if(!pin_separator(block,page,frame,error)){
+            return false;
+        }
+        std::size_t n = page.count();
+        if(!is_root && n < min_separator_key()){
+            walk.findings.push_back(label + " has too few separators");
+        } if(n > max_separator_key()){
+            walk.findings.push_back(label + " has too many separators");
+        }
+
+        std::uint32_t first_child = page.first_child();
+        std::vector<idx::IndexEntry> pairs;
+        for(std::size_t i=0  ; i < n ; i++){
+            pairs.push_back(page.entry(i));
+        }
+        release(manager_,frame,false);
+
+        for (std::size_t i=0  ; i < n ; i++){
+            if(codec_.compare(pairs[i-1].key.data(),pairs[i].key.data())>0){
+                walk.findings.push_back(label + " has non-ascending separators");
+            }
+        }
+        std::optional<std::string> child_min;
+        if(!verify_rec(first_child,depth+1,false,walk,error,&child_min)){
+            return false;
+        } if(subtree_min!=nullptr){
+            *subtree_min = child_min;
+        }
+        for(std::size_t i=0  ; i < n ; i++){
+          if(!verify_rec(pairs[i].child, depth + 1, false, walk,error, &child_min)){
+                return false;
+            } bool exact = child_min.has_value() && codec_.compare(pairs[i].key.data(), child_min->data());
+           if (!exact){
+                walk.findings.push_back(label + " separator " + std::to_string(i) + " is not exact");
+            } 
+         }
+         return true;
+    }
+    BptLeafPage leaf;
+    if(!pin_leaf(block,leaf,frame,error)){
+        return false;
+    }
+    std::size_t n = leaf.count();
+    if(!is_root && n < min_leaf_entries()){
+        
+        walk.findings.push_back(label + " has too few entries");
+    } if(n > max_leaf_entries()){
+        walk.findings.push_back(label + " has too many entries");
+    }
+    for(std::size_t i=0  ; i < n ; i++){
+         idx::DataEntry entry = leaf.get_entry(i);
+        if(i > 0){
+             idx::DataEntry previous = leaf.get_entry(i - 1);
+            if(codec_.compare(previous.key.data(),entry.key.data()) > 0){
+                walk.findings.push_back(label + " is out of order at entry " + std::to_string(i));
+            }
+        } if(!walk.occupied(entry.rid)){
+            walk.findings.push_back(label + " has dangling rid at entry " + std::to_string(i));
+        }
+    }
+    if(n > 0 && subtree_min!=nullptr){
+        *subtree_min = leaf.get_entry(0).key;
+    }
+    release(manager_,frame,false);
+    walk.walked += n;
+    if(walk.min_depth == 0 || depth < walk.min_depth){
+        walk.min_depth = depth;
+    } if(depth > walk.max_depth){
+        walk.max_depth = depth;
+    }
+    return true;
 }
 
 }
