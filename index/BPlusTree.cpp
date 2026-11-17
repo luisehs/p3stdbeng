@@ -668,7 +668,7 @@ std::uint32_t BPlusTree::run_start(std::uint32_t landing,
            return idx::kNoPage;
         }
         std::size_t prev_count = prev_leaf.count();
-        bool equal = prev_count > 0 && codec_.compare(prev_leaf.get_entry(prev_count - 1), key.data(),key_bytes.data()) == 0;
+        bool equal = prev_count > 0 && codec_.compare(prev_leaf.get_entry(prev_count - 1).key.data(),key_bytes.data()) == 0;
         release(manager_, frame, false);
         if(!equal) {
            break;
@@ -1025,13 +1025,83 @@ bool BPlusTree::insert_aux(std::uint32_t block, std::uint32_t levels_remaining,
     // its child becomes the new page's first child
     // (move_tail_to(middle + 1)), filling `split` for the parent. The
     // wrapper turns a root split into a new root.
-    (void)block;
-    (void)levels_remaining;
-    (void)key_bytes;
-    (void)rid;
-    (void)split;
-    (void)error;
-    return false;
+    // (void)block;
+    // (void)levels_remaining;
+    // (void)key_bytes;
+    // (void)rid;
+    // (void)split;
+    // (void)error;
+    // return false;
+    split = {};
+    if (levels_remaining <= 1) {
+        return insert_leaf(block, key_bytes, rid, split, error);
+    }
+    BptSeparatorPage page;
+    std::size_t frame = 0;
+    if (!pin_separator(block, page, frame, error)) {
+        return false;
+    }
+    const auto i = page.routing_child_index(key_bytes.data(), codec_);
+    const auto child = i ? page.child(i - 1) : page.first_child();
+    release(manager_, frame, false);
+    Split carried;
+    if (!insert_aux(child, levels_remaining - 1, key_bytes, rid, carried, error)) {
+        return false;
+    }
+    if (carried.new_block == idx::kNoPage) {
+        return true;
+    }
+    if (!pin_separator(block, page, frame, error)) {
+        return false;
+    }
+
+    if (page.count() < max_separator_keys()) {
+        const bool ok = page.insert_pair_after(i, {carried.separator_key, carried.new_block}, error);
+        release(manager_, frame, ok);
+        return ok;
+    }
+    
+    std::vector<idx::IndexEntry> entries;
+    for (std::size_t j = 0; j < page.count(); ++j) {
+        entries.push_back(page.entry(j));
+    }
+    entries.insert(entries.begin() + i, {carried.separator_key, carried.new_block});
+    const auto first = page.first_child();
+    release(manager_, frame, false);
+    std::uint32_t fresh_block = 0;
+    std::size_t fresh_frame = 0;
+    if (!alloc_next_block(fresh_block, fresh_frame, error)) {
+        return false;
+    }
+    BptSeparatorPage fresh;
+    fresh.bind(manager_.frame(fresh_frame).buffer, codec_.width());
+    fresh.format();
+    if (!pin_separator(block, page, frame, error)) {
+        release(manager_, fresh_frame, true);
+        return false;
+    }
+    const auto middle = min_separator_keys();
+    page.format();
+    page.set_first_child(first);
+    fresh.set_first_child(entries[middle].child);
+    for (std::size_t j = 0; j < middle; ++j) {
+        if (!page.append(entries[j], error)) {
+            release(manager_, frame, true);
+            release(manager_, fresh_frame, true);
+            return false;
+        }
+    }
+    for (std::size_t j = middle + 1; j < entries.size(); ++j) {
+        if (!fresh.append(entries[j], error)) {
+            release(manager_, frame, true);
+            release(manager_, fresh_frame, true);
+            return false;
+        }
+    }
+    split = {entries[middle].key, fresh_block};
+    release(manager_, frame, true);
+    release(manager_, fresh_frame, true);
+    return true;
 }
 // BPlusTree::insert_leaf — the leaf phase of insert_aux: room within
 // 2d means a plain sorted insert; a full leaf (2d entries) splits per
@@ -1063,12 +1133,72 @@ bool BPlusTree::insert_leaf(std::uint32_t block, const std::string& key_bytes,
     // (equal keys go RIGHT — where the routing sends their duplicates).
     // Fill `split` with the copied-up separator (the new leaf's smallest
     // key) and the new block.
-    (void)block;
-    (void)key_bytes;
-    (void)rid;
-    (void)split;
-    (void)error;
-    return false;
+    // (void)block;
+    // (void)key_bytes;
+    // (void)rid;
+    // (void)split;
+    // (void)error;
+    // return false;
+    split = {};
+    BptLeafPage leaf;
+    std::size_t frame = 0;
+    if (!pin_leaf(block, leaf, frame, error)) {
+        return false;
+    }
+    if (leaf.count() < max_leaf_entries()) {
+        const bool ok = leaf.insert_entry({key_bytes, rid}, codec_, error);
+        release(manager_, frame, ok);
+        return ok;
+    }
+
+    const auto next = leaf.next_leaf();
+    release(manager_, frame, false);
+    std::uint32_t fresh_block = 0;
+    std::size_t fresh_frame = 0;
+    if (!alloc_next_block(fresh_block, fresh_frame, error)) {
+        return false;
+    }
+    BptLeafPage fresh;
+    fresh.bind(manager_.frame(fresh_frame).buffer, codec_.width());
+    fresh.format(block, next);
+    if (!pin_leaf(block, leaf, frame, error)) {
+        release(manager_, fresh_frame, true);
+        return false;
+    }
+
+    std::vector<idx::DataEntry> entries;
+    for (std::size_t i = 0; i < leaf.count(); ++i) {
+        entries.push_back(leaf.get_entry(i));
+    }
+    auto at = std::upper_bound(entries.begin(), entries.end(), key_bytes,
+        [&](const std::string& key, const idx::DataEntry& e) {
+            return codec_.compare(key.data(), e.key.data()) < 0;
+        });
+    entries.insert(at, {key_bytes, rid});
+    const auto prev = leaf.prev_leaf();
+    leaf.format(prev, fresh_block);
+
+    for (std::size_t i = 0; i < entries.size(); ++i) {
+        auto& target = i < min_leaf_entries() ? leaf : fresh;
+        if (!target.insert_entry(entries[i], codec_, error)) {
+            release(manager_, frame, true);
+            release(manager_, fresh_frame, true);
+            return false;
+        }
+    }
+
+    split = {fresh.get_entry(0).key, fresh_block};
+    release(manager_, frame, true);
+    release(manager_, fresh_frame, true);
+    if (next != idx::kNoPage) {
+        BptLeafPage neighbour;
+        if (!pin_leaf(next, neighbour, frame, error)) {
+            return false;
+        }
+        neighbour.set_prev_leaf(fresh_block);
+        release(manager_, frame, true);
+    }
+    return true;
 }
 
 // --- the recursion contract: erase ----------------------------------------------
@@ -1483,15 +1613,50 @@ bool BPlusTree::borrow_from_left(std::uint32_t block, std::size_t child_index,
     // key move through the parent (the child's new first child and first
     // key; the parent's separator becomes the moved key). Release
     // everything dirty; clear up.underflow.
-    (void)block;
-    (void)child_index;
-    (void)child_block;
-    (void)left_block;
-    (void)child_is_leaf;
+    // (void)block;
+    // (void)child_index;
+    // (void)child_block;
+    // (void)left_block;
+    // (void)child_is_leaf;
+    // (void)child_count;
+    // (void)up;
+    // (void)error;
+    // return false;
     (void)child_count;
-    (void)up;
-    (void)error;
-    return false;
+    std::unordered_map<std::uint32_t, std::size_t> frames;
+    if (!pin_surgery(manager_, file_, {block, child_block, left_block}, frames, error)) {
+        return false;
+    }
+    BptSeparatorPage parent;
+    parent.bind(manager_.frame(frames.at(block)).buffer, codec_.width());
+    if (child_is_leaf) {
+        BptLeafPage child, left;
+        child.bind(manager_.frame(frames.at(child_block)).buffer, codec_.width());
+        left.bind(manager_.frame(frames.at(left_block)).buffer, codec_.width());
+        const auto moved = left.get_entry(left.count() - 1);
+        if (!left.erase_entry(left.count() - 1, error) ||
+            !child.insert_entry(moved, codec_, error)) {
+            release_surgery(manager_, frames);
+            return false;
+        }
+        parent.set_separator_key(child_index - 1, moved.key.data());
+    } else {
+        BptSeparatorPage child, left;
+        child.bind(manager_.frame(frames.at(child_block)).buffer, codec_.width());
+        left.bind(manager_.frame(frames.at(left_block)).buffer, codec_.width());
+        const auto moved = left.entry(left.count() - 1);
+        const auto boundary = parent.entry(child_index - 1).key;
+        if (!child.insert_pair_after(0, {boundary, child.first_child()}, error)) {
+            release_surgery(manager_, frames);
+            return false;
+        }
+        child.set_first_child(moved.child);
+        left.erase_pair(left.count() - 1, codec_.width());
+        parent.set_separator_key(child_index - 1, moved.key.data());
+    }
+    up.underflow = parent.count() < min_separator_keys();
+    release_surgery(manager_, frames);
+    return true;
 }
 // BPlusTree::borrow_from_right — redistribution from the right sibling
 // (slide 41): a leaf child gains the sibling's first entry at its end;
@@ -1527,15 +1692,57 @@ bool BPlusTree::borrow_from_right(std::uint32_t block, std::size_t child_index,
     // rewrites (or propagates) its left boundary. Separator child:
     // rotate — the sibling's first child and first key move through the
     // parent. Release everything dirty; clear up.underflow.
-    (void)block;
-    (void)child_index;
-    (void)child_block;
-    (void)right_block;
-    (void)child_is_leaf;
-    (void)child_count;
-    (void)up;
-    (void)error;
-    return false;
+    // (void)block;
+    // (void)child_index;
+    // (void)child_block;
+    // (void)right_block;
+    // (void)child_is_leaf;
+    // (void)child_count;
+    // (void)up;
+    // (void)error;
+    // return false;
+    std::unordered_map<std::uint32_t, std::size_t> frames;
+    if (!pin_surgery(manager_, file_, {block, child_block, right_block}, frames, error)) {
+        return false;
+    }
+    BptSeparatorPage parent;
+    parent.bind(manager_.frame(frames.at(block)).buffer, codec_.width());
+    if (child_is_leaf) {
+        BptLeafPage child, right;
+        child.bind(manager_.frame(frames.at(child_block)).buffer, codec_.width());
+        right.bind(manager_.frame(frames.at(right_block)).buffer, codec_.width());
+        const auto moved = right.get_entry(0);
+        if (!child.insert_entry(moved, codec_, error) ||
+            !right.erase_entry(0, error)) {
+            release_surgery(manager_, frames);
+            return false;
+        }
+        
+        parent.set_separator_key(child_index, right.get_entry(0).key.data());
+        if (child_count == 0) {
+            if (child_index) {
+                parent.set_separator_key(child_index - 1, moved.key.data());
+            } else {
+                up.first_changed = true;
+                up.new_first = moved.key;
+            }
+        }
+    } else {
+        BptSeparatorPage child, right;
+        child.bind(manager_.frame(frames.at(child_block)).buffer, codec_.width());
+        right.bind(manager_.frame(frames.at(right_block)).buffer, codec_.width());
+        const auto moved = right.entry(0);
+        if (!child.append({parent.entry(child_index).key, right.first_child()}, error)) {
+            release_surgery(manager_, frames);
+            return false;
+        }
+        right.set_first_child(moved.child);
+        right.erase_pair(0, codec_.width());
+        parent.set_separator_key(child_index, moved.key.data());
+    }
+    up.underflow = parent.count() < min_separator_keys();
+    release_surgery(manager_, frames);
+    return true;
 }
 // BPlusTree::merge_child — the merge (slides 42-43, 47): the
 // underflowed child folds into its left sibling (preferred) or right
@@ -1575,16 +1782,84 @@ bool BPlusTree::merge_child(std::uint32_t block, std::size_t child_index,
     // the separator from the parent (erase_pair), chain the vanished
     // page onto the free list (chain_freed), and report the parent's own
     // underflow upward (up.underflow).
-    (void)block;
-    (void)child_index;
-    (void)child_block;
-    (void)left_block;
-    (void)right_block;
-    (void)child_is_leaf;
-    (void)child_count;
-    (void)up;
-    (void)error;
-    return false;
+    // (void)block;
+    // (void)child_index;
+    // (void)child_block;
+    // (void)left_block;
+    // (void)right_block;
+    // (void)child_is_leaf;
+    // (void)child_count;
+    // (void)up;
+    // (void)error;
+    // return false;
+    const bool into_left = left_block != idx::kNoPage;
+    const auto survivor = into_left ? left_block : child_block;
+    const auto vanished = into_left ? child_block : right_block;
+    const auto boundary = into_left ? child_index - 1 : child_index;
+    std::uint32_t next = idx::kNoPage;
+    if (child_is_leaf) {
+        BptLeafPage page;
+        std::size_t frame = 0;
+        if (!pin_leaf(vanished, page, frame, error)) {
+            return false;
+        }
+        next = page.next_leaf();
+        release(manager_, frame, false);
+    }
+    std::vector<std::uint32_t> blocks = {block, survivor, vanished};
+    if (next != idx::kNoPage) {
+        blocks.push_back(next);
+    }
+    std::unordered_map<std::uint32_t, std::size_t> frames;
+    if (!pin_surgery(manager_, file_, blocks, frames, error)) {
+        return false;
+    }
+    BptSeparatorPage parent;
+    parent.bind(manager_.frame(frames.at(block)).buffer, codec_.width());
+    if (child_is_leaf) {
+        BptLeafPage keep, gone;
+        keep.bind(manager_.frame(frames.at(survivor)).buffer, codec_.width());
+        gone.bind(manager_.frame(frames.at(vanished)).buffer, codec_.width());
+        for (std::size_t i = 0; i < gone.count(); ++i) {
+            if (!keep.insert_entry(gone.get_entry(i), codec_, error)) {
+                release_surgery(manager_, frames);
+                return false;
+            }
+        }
+        keep.set_next_leaf(next);
+        if (next != idx::kNoPage) {
+            BptLeafPage neighbour;
+            neighbour.bind(manager_.frame(frames.at(next)).buffer, codec_.width());
+            neighbour.set_prev_leaf(survivor);
+        }
+        if (!into_left && child_count == 0 && keep.count()) {
+            if (child_index) {
+                parent.set_separator_key(child_index - 1, keep.get_entry(0).key.data());
+            } else {
+                up.first_changed = true;
+                up.new_first = keep.get_entry(0).key;
+            }
+        }
+    } else {
+        BptSeparatorPage keep, gone;
+        keep.bind(manager_.frame(frames.at(survivor)).buffer, codec_.width());
+        gone.bind(manager_.frame(frames.at(vanished)).buffer, codec_.width());
+        if (!keep.append({parent.entry(boundary).key, gone.first_child()}, error)) {
+            release_surgery(manager_, frames);
+            return false;
+        }
+        for (std::size_t i = 0; i < gone.count(); ++i) {
+            if (!keep.append(gone.entry(i), error)) {
+                release_surgery(manager_, frames);
+                return false;
+            }
+        }
+    }
+    parent.erase_pair(boundary, codec_.width());
+    chain_freed(vanished, manager_.frame(frames.at(vanished)).buffer);
+    up.underflow = parent.count() < min_separator_keys();
+    release_surgery(manager_, frames);
+    return true;
 }
 // BPlusTree::rebuild_from_leaves — the crossed-subtree erase's simple
 // correct repair: collect every entry by walking the leaf chain, close
@@ -1829,9 +2104,9 @@ bool BPlusTree::verify_rec(std::uint32_t block, std::uint32_t depth,
             return false;
         }
         std::size_t n = page.count();
-        if(!is_root && n < min_separator_key()){
+        if(!is_root && n < min_separator_keys()){
             walk.findings.push_back(label + " has too few separators");
-        } if(n > max_separator_key()){
+        } if(n > max_separator_keys()){
             walk.findings.push_back(label + " has too many separators");
         }
 
@@ -1842,7 +2117,7 @@ bool BPlusTree::verify_rec(std::uint32_t block, std::uint32_t depth,
         }
         release(manager_,frame,false);
 
-        for (std::size_t i=0  ; i < n ; i++){
+        for (std::size_t i=1  ; i < n ; i++){
             if(codec_.compare(pairs[i-1].key.data(),pairs[i].key.data())>0){
                 walk.findings.push_back(label + " has non-ascending separators");
             }
@@ -1856,7 +2131,7 @@ bool BPlusTree::verify_rec(std::uint32_t block, std::uint32_t depth,
         for(std::size_t i=0  ; i < n ; i++){
           if(!verify_rec(pairs[i].child, depth + 1, false, walk,error, &child_min)){
                 return false;
-            } bool exact = child_min.has_value() && codec_.compare(pairs[i].key.data(), child_min->data());
+            } bool exact = child_min.has_value() && codec_.compare(pairs[i].key.data(), child_min->data()) == 0;
            if (!exact){
                 walk.findings.push_back(label + " separator " + std::to_string(i) + " is not exact");
             } 
