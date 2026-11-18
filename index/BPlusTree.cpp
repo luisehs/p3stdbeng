@@ -1349,20 +1349,24 @@ bool BPlusTree::erase_rec(std::uint32_t block, std::uint32_t levels_remaining,
     if(!erase_rec(child, levels_remaining - 1, key_bytes, rid, child_up, error)) {
         return false;
     }
-    if(child_up.first_changed){
-        if(pos == 0) {
+    if (child_up.first_changed) {
+        if (pos == 0) {
             up.first_changed = true;
             up.new_first = child_up.new_first;
-        }else if (!pin_separator(block, page, frame, error)) {
-            return false;
+        } else if (!child_up.new_first.empty()) {
+            if (!pin_separator(block, page, frame, error)) {
+                return false;
+            }
+            page.set_separator_key(pos - 1, child_up.new_first.data());
+            release(manager_, frame, true);
         }
-        page.set_separator_key(pos - 1, child_up.new_first.data());
-        release(manager_, frame, true);
     }
-    if(child_up.underflow) {
+    if (child_up.underflow) {
         return fix_child_underflow(block, levels_remaining, pos, up, error);
-        }
-    return true;
+    }
+    std::size_t count = quick_count(block, false, error);
+    up.underflow = count < min_separator_keys();
+    return error.empty();
 
 }
 // BPlusTree::erase_leaf — the leaf phase of erase_rec: find the exact
